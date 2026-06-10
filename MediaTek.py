@@ -1,13 +1,15 @@
-# MediaTek Boot Image Parser - Original Implementation
-
 import hashlib
 import struct
 import sys
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path
+
+
+MAX_FILE_SIZE = 256 * 1024 * 1024
+MAX_GFH_HEADER_SIZE = 4 * 1024 * 1024
 
 
 class MagicTokens:
@@ -18,7 +20,7 @@ class MagicTokens:
     ANDROID_ROM_INFO = b'AND_ROMINFO_v'
     ANDROID_SECURITY_CTRL = b'AND_SECCTRL_v'
     ANDROID_SECURITY_KEY = b'AND_SECRO_v'
-    
+
     BOOT_DEVICES = {
         b'EMMC_BOOT\x00\x00\x00': 'EMMC_BOOT',
         b'SDMMC_BOOT\x00\x00': 'SDMMC_BOOT',
@@ -52,6 +54,13 @@ class PayloadType(Enum):
     EXEC_PARAMS = 0x0007
     TRUST_ANCHOR = 0x000A
     APPLICATION_PAYLOAD = 0x000B
+
+
+VALID_PAYLOAD_TYPES = {
+    PayloadType.ARM_CODE.value,
+    PayloadType.EXTENDED_ARM.value,
+    PayloadType.APPLICATION_PAYLOAD.value,
+}
 
 
 class StorageType(Enum):
@@ -166,14 +175,14 @@ class SystemFirmwareInfo:
     security_config_start: int
     security_config_size: int
     security: Optional[SecuritySettings] = None
-    trusted_boot_parts: List[str] = None
+    trusted_boot_parts: Optional[List[str]] = None
     crypto_keys: Optional[CryptographicMaterial] = None
 
 
 @dataclass
 class GfhPayload:
     header: GfhBlockHeader
-    data: Any
+    data: Union[FileDescriptor, SecuritySettings, Dict[str, Any], bytes, bool, None]
     raw_bytes: bytes
 
 
@@ -187,10 +196,18 @@ class PreloaderAnalysis:
     extracted_code: bytes
     attached_signature: bytes
     system_info: Optional[SystemFirmwareInfo]
-    
+
+    @property
+    def md5(self) -> str:
+        return hashlib.md5(self.raw_data).hexdigest()
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.raw_data).hexdigest()
+
     @property
     def checksum(self) -> str:
-        return hashlib.md5(self.raw_data).hexdigest()
+        return self.md5
 
 
 class ParserError(Exception):
@@ -206,7 +223,11 @@ class StructureNotFoundError(ParserError):
 
 
 def extract_string(buffer: bytes) -> str:
-    return buffer.split(b'\x00', 1)[0].decode('ascii', errors='replace')
+    raw = buffer.split(b'\x00', 1)[0]
+    decoded = raw.decode('ascii', errors='replace')
+    if '\ufffd' in decoded:
+        decoded = raw.decode('latin-1', errors='replace')
+    return decoded
 
 
 def get_enum_name(enum_class, value: int) -> str:
@@ -216,48 +237,64 @@ def get_enum_name(enum_class, value: int) -> str:
         return f'0x{value:04x}'
 
 
+_SECTION_PARSERS: Dict[GfhSectionType, Any] = {}
+
+
+def _build_section_parsers() -> Dict[GfhSectionType, Any]:
+    return {
+        GfhSectionType.FILE_DESCRIPTOR: parse_file_descriptor,
+        GfhSectionType.BOOTLOADER_INFO: parse_boot_flags,
+        GfhSectionType.ROM_CONFIG: parse_rom_configuration,
+        GfhSectionType.CLONE_PROTECTION: parse_anti_clone_data,
+        GfhSectionType.ROM_SECURITY: parse_security_configuration,
+        GfhSectionType.BOOT_KEY: parse_key_material,
+    }
+
+
 def parse_device_config(data: bytes) -> Optional[BootHeader]:
     if len(data) < 2048:
         return None
-    
+
     device_magic = data[:12]
     if device_magic not in MagicTokens.BOOT_DEVICES:
         return None
-    
+
     device_name = MagicTokens.BOOT_DEVICES[device_magic]
     version, block_size = struct.unpack_from('<II', data, 12)
-    
+
     if block_size not in (512, 2048, 4096):
         return None
-    
+
     storage_info = StorageDeviceInfo(device_name, version, block_size)
-    
+
     brlyt_start = 512
     if data[brlyt_start:brlyt_start + 8] != MagicTokens.BRLYT_IDENTIFIER:
         return None
-    
+
     brlyt_version, boot_addr, app_addr = struct.unpack_from(
         '<III', data, brlyt_start + 8
     )
     region_info = BootRegionInfo(brlyt_version, boot_addr, app_addr)
-    
+
     descriptors = []
     desc_table_start = brlyt_start + 20
-    
+
     for idx in range(8):
         offset = desc_table_start + idx * 20
         if offset + 20 > len(data):
             break
-        
+
         marker, storage_id, comp_type, start_pos, end_pos, flags = \
             struct.unpack_from('<4sHHIII', data, offset)
-        
+
         if marker == MagicTokens.BLOCK_EXIST_MARKER:
+            if storage_id > 0xFFFF or comp_type > 0xFFFF:
+                continue
             descriptors.append(
-                LoaderDescriptor(marker, storage_id, comp_type, 
-                               start_pos, end_pos, flags)
+                LoaderDescriptor(marker, storage_id, comp_type,
+                                 start_pos, end_pos, flags)
             )
-    
+
     return BootHeader(storage_info, region_info, descriptors)
 
 
@@ -265,47 +302,52 @@ def locate_gfh_block(data: bytes) -> int:
     if len(data) >= 2048 and data[:12] in MagicTokens.BOOT_DEVICES:
         if len(data) > 528 and data[512:520] == MagicTokens.BRLYT_IDENTIFIER:
             header_size = struct.unpack_from('<I', data, 528)[0]
+            if header_size > MAX_GFH_HEADER_SIZE:
+                raise ValidationError(
+                    f"Implausible GFH header size: 0x{header_size:08x}"
+                )
             if header_size + 3 <= len(data) and \
                data[header_size:header_size + 3] == MagicTokens.GFH_SIGNATURE:
                 return header_size
-        
-        if data[2048:2051] == MagicTokens.GFH_SIGNATURE:
+
+        if len(data) > 2051 and data[2048:2051] == MagicTokens.GFH_SIGNATURE:
             return 2048
-    
+
     if data[:3] == MagicTokens.GFH_SIGNATURE:
         return 0
-    
-    search_limit = min(len(data), 65536)
+
+    search_limit = min(len(data) - 3, 65536)
     target_bytes = MagicTokens.GFH_SIGNATURE_DWORD.to_bytes(4, 'little')
-    
-    for offset in range(0, search_limit - 3, 4):
-        if data[offset:offset + 4] == target_bytes:
-            return offset
-    
+
+    offset = data.find(target_bytes, 0, search_limit)
+    if offset != -1:
+        return offset
+
     raise StructureNotFoundError("Unable to locate GFH block")
 
 
 def parse_gfh_header(data: bytes, position: int) -> Optional[GfhBlockHeader]:
     if position + 8 > len(data):
         return None
-    
+
     magic, ver, length, block_type = struct.unpack_from('<3sBHH', data, position)
-    
+
     if magic != MagicTokens.GFH_SIGNATURE or length < 8:
         return None
-    
+
     return GfhBlockHeader(magic, ver, length, block_type)
 
 
 def parse_file_descriptor(raw: bytes) -> Optional[FileDescriptor]:
-    if len(raw) < 44:
+    required = struct.calcsize('<12sIHBBIIIIIII')
+    if len(raw) < required:
         return None
-    
+
     try:
         (name_raw, _, category, storage, security, exec_addr,
          total_len, max_len, header_len, sig_len, entry_off, processed) = \
             struct.unpack_from('<12sIHBBIIIIIII', raw)
-        
+
         return FileDescriptor(
             filename=extract_string(name_raw),
             payload_category=category,
@@ -333,11 +375,11 @@ def parse_boot_flags(raw: bytes) -> Optional[bool]:
 def parse_rom_configuration(raw: bytes) -> Optional[Dict[str, Any]]:
     if len(raw) < 92:
         return None
-    
+
     try:
         (flags, auto_timeout, _, _, _, _, _, _, arm64_magic, _, _, kcol0) = \
             struct.unpack_from('<II64sBBBBBBBBI', raw)
-        
+
         return {
             'raw_flags': flags,
             'auto_detect_timeout': auto_timeout,
@@ -357,7 +399,7 @@ def parse_rom_configuration(raw: bytes) -> Optional[Dict[str, Any]]:
 def parse_anti_clone_data(raw: bytes) -> Optional[Dict[str, int]]:
     if len(raw) < 12:
         return None
-    
+
     try:
         b2k, b2c, offset, length = struct.unpack_from('<HHII', raw)
         return {'b2k': b2k, 'b2c': b2c, 'offset': offset, 'length': length}
@@ -368,10 +410,10 @@ def parse_anti_clone_data(raw: bytes) -> Optional[Dict[str, int]]:
 def parse_security_configuration(raw: bytes) -> Optional[Dict[str, Any]]:
     if len(raw) < 44:
         return None
-    
+
     try:
         flags, customer, perm_magic = struct.unpack_from('<I32sI', raw)
-        
+
         return {
             'jtag_enabled': bool(flags & 1),
             'debug_enabled': bool(flags & 2),
@@ -385,7 +427,7 @@ def parse_security_configuration(raw: bytes) -> Optional[Dict[str, Any]]:
 def parse_key_material(raw: bytes) -> Optional[Dict[str, bytes]]:
     if len(raw) < 524:
         return None
-    
+
     key_data = raw[:524]
     return {
         'key_data': key_data,
@@ -396,15 +438,15 @@ def parse_key_material(raw: bytes) -> Optional[Dict[str, bytes]]:
 def extract_security_settings(data: bytes, position: int) -> Optional[SecuritySettings]:
     if position + 48 > len(data):
         return None
-    
+
     try:
         (magic, ver, usb_mode, boot_mode, modem_auth, sds_enable,
          ac_enable, aes_legacy, secro_ac, sml_ac, _) = \
             struct.unpack_from('<16sIIIIIBBBB12s', data, position)
-        
+
         if not magic.startswith(MagicTokens.ANDROID_SECURITY_CTRL):
             return None
-        
+
         return SecuritySettings(
             version=ver,
             usb_download_mode=usb_mode,
@@ -423,7 +465,7 @@ def extract_security_settings(data: bytes, position: int) -> Optional[SecuritySe
 def extract_boot_components(data: bytes, position: int) -> List[str]:
     if position + 90 > len(data):
         return []
-    
+
     try:
         components = struct.unpack_from('<' + '10s' * 9, data, position)
         return [extract_string(c).strip() for c in components if extract_string(c).strip()]
@@ -434,14 +476,14 @@ def extract_boot_components(data: bytes, position: int) -> List[str]:
 def extract_crypto_keys(data: bytes, position: int) -> Optional[CryptographicMaterial]:
     if position + 340 > len(data):
         return None
-    
+
     try:
         (magic, ver, img_n, img_e, aes_key, seed, sml_n, sml_e) = \
             struct.unpack_from('<16sI256s5s32s16s256s5s', data, position)
-        
+
         if not magic.startswith(MagicTokens.ANDROID_SECURITY_KEY):
             return None
-        
+
         return CryptographicMaterial(
             key_version=ver,
             image_public_key=img_n,
@@ -456,26 +498,33 @@ def extract_crypto_keys(data: bytes, position: int) -> Optional[CryptographicMat
 
 
 def parse_system_information(content: bytes) -> Optional[SystemFirmwareInfo]:
-    search_start = max(0, len(content) - 65536)
+    magic = MagicTokens.ANDROID_ROM_INFO
+    magic_len = len(magic)
+
+    search_end = len(content)
+    search_start = max(0, search_end - 65536)
+
     info_offset = None
-    
-    for offset in range(search_start, min(len(content), 65536), 4):
-        if content[offset:offset + len(MagicTokens.ANDROID_ROM_INFO)] == MagicTokens.ANDROID_ROM_INFO:
-            info_offset = offset
+    pos = search_start
+    while pos < search_end - magic_len:
+        found = content.find(magic, pos, search_end)
+        if found == -1:
             break
-    
+        info_offset = found
+        break
+
     if info_offset is None or info_offset + 128 > len(content):
         return None
-    
+
     try:
-        (magic, ver, platform_raw, project_raw, ro_exists,
+        (magic_raw, ver, platform_raw, project_raw, ro_exists,
          ro_start, ro_len, ac_start, ac_len, cfg_start,
-         cfg_len, _) = struct.unpack_from('<16sI16s16sIIIIIII128s', 
-                                         content, info_offset)
-        
-        if not magic.startswith(MagicTokens.ANDROID_ROM_INFO):
+         cfg_len, _) = struct.unpack_from('<16sI16s16sIIIIIII128s',
+                                          content, info_offset)
+
+        if not magic_raw.startswith(MagicTokens.ANDROID_ROM_INFO):
             return None
-        
+
         system_info = SystemFirmwareInfo(
             info_version=ver,
             platform_identifier=extract_string(platform_raw),
@@ -488,107 +537,108 @@ def parse_system_information(content: bytes) -> Optional[SystemFirmwareInfo]:
             security_config_start=cfg_start,
             security_config_size=cfg_len
         )
-        
+
         security_offset = info_offset + 128
         system_info.security = extract_security_settings(content, security_offset)
-        
+
         if system_info.security:
             components_offset = security_offset + 48 + 18
             system_info.trusted_boot_parts = extract_boot_components(content, components_offset)
-            
+
             keys_offset = components_offset + 90
             system_info.crypto_keys = extract_crypto_keys(content, keys_offset)
-        
+
         return system_info
     except struct.error:
         return None
 
 
-def parse_gfh_sections(data: bytes, start: int, end: Optional[int] = None) -> Tuple[Optional[FileDescriptor], List[GfhPayload]]:
+def parse_gfh_sections(
+    data: bytes,
+    start: int,
+    end: Optional[int] = None
+) -> Tuple[Optional[FileDescriptor], List[GfhPayload]]:
+    global _SECTION_PARSERS
+    if not _SECTION_PARSERS:
+        _SECTION_PARSERS = _build_section_parsers()
+
     main_descriptor = None
     sections = []
     limit = end if end is not None else len(data)
     position = start
-    
-    section_parsers = {
-        GfhSectionType.FILE_DESCRIPTOR: parse_file_descriptor,
-        GfhSectionType.BOOTLOADER_INFO: parse_boot_flags,
-        GfhSectionType.ROM_CONFIG: parse_rom_configuration,
-        GfhSectionType.CLONE_PROTECTION: parse_anti_clone_data,
-        GfhSectionType.ROM_SECURITY: parse_security_configuration,
-        GfhSectionType.BOOT_KEY: parse_key_material
-    }
-    
+
     while position + 8 <= limit:
         header = parse_gfh_header(data, position)
         if not header:
             break
-        
+
         if position + header.block_length > len(data):
             break
-        
+
         payload_start = position + 8
         payload_end = position + header.block_length
         raw_payload = data[payload_start:payload_end]
-        
-        section_type = GfhSectionType(header.block_type)
-        parser = section_parsers.get(section_type)
-        
-        if parser:
-            parsed_data = parser(raw_payload)
-        else:
+
+        try:
+            section_type = GfhSectionType(header.block_type)
+            parser = _SECTION_PARSERS.get(section_type)
+            parsed_data = parser(raw_payload) if parser else raw_payload
+        except ValueError:
+            section_type = None
             parsed_data = raw_payload
-        
+
         if section_type == GfhSectionType.FILE_DESCRIPTOR and isinstance(parsed_data, FileDescriptor):
             main_descriptor = parsed_data
-        
+
         sections.append(GfhPayload(header, parsed_data, data[position:position + header.block_length]))
         position += header.block_length
-    
+
     return main_descriptor, sections
 
 
 def analyze_preloader(binary_data: bytes) -> PreloaderAnalysis:
     if len(binary_data) < 2056:
         raise ValidationError(f"Binary too small: {len(binary_data)} bytes")
-    
+
     boot_header = parse_device_config(binary_data)
     gfh_offset = locate_gfh_block(binary_data)
-    
+
     main_desc, all_sections = parse_gfh_sections(binary_data, gfh_offset)
-    
+
     if main_desc is None:
         raise StructureNotFoundError("Missing file descriptor section")
-    
-    if main_desc.payload_category not in (PayloadType.ARM_CODE.value,
-                                          PayloadType.EXTENDED_ARM.value,
-                                          PayloadType.APPLICATION_PAYLOAD.value):
+
+    if main_desc.payload_category not in VALID_PAYLOAD_TYPES:
         raise ValidationError(f"Invalid payload type: 0x{main_desc.payload_category:04x}")
-    
+
     header_boundary = gfh_offset + main_desc.header_length
     if header_boundary > len(binary_data):
         raise ValidationError("Header extends beyond file")
-    
-    _, sections = parse_gfh_sections(binary_data, gfh_offset, header_boundary)
-    
+
+    bounded_sections = [
+        s for s in all_sections
+        if s.raw_bytes
+        and (binary_data.index(s.raw_bytes) + len(s.raw_bytes)) <= header_boundary
+    ]
+
     payload_start = gfh_offset + main_desc.header_length
     payload_end = gfh_offset + main_desc.total_length - main_desc.signature_length
     signature_start = payload_end
     signature_end = gfh_offset + main_desc.total_length
-    
+
     if payload_end > len(binary_data) or signature_end > len(binary_data):
         raise ValidationError("File appears truncated")
-    
+
     extracted_code = binary_data[payload_start:payload_end]
     signature_data = binary_data[signature_start:signature_end]
     system_info = parse_system_information(extracted_code)
-    
+
     return PreloaderAnalysis(
         raw_data=binary_data,
         boot_structure=boot_header,
         gfh_start_offset=gfh_offset,
         main_descriptor=main_desc,
-        all_sections=sections,
+        all_sections=all_sections,
         extracted_code=extracted_code,
         attached_signature=signature_data,
         system_info=system_info
@@ -600,12 +650,13 @@ def generate_report(analysis: PreloaderAnalysis, verbose: bool = False) -> str:
     lines.append("=" * 70)
     lines.append("MediaTek Preloader Analysis Report")
     lines.append("=" * 70)
-    
+
     lines.append(f"\n[File Information]")
-    lines.append(f"  MD5 Checksum: {analysis.checksum}")
+    lines.append(f"  MD5:    {analysis.md5}")
+    lines.append(f"  SHA256: {analysis.sha256}")
     lines.append(f"  Total Size: {len(analysis.raw_data):,} bytes")
     lines.append(f"  GFH Location: 0x{analysis.gfh_start_offset:04x}")
-    
+
     lines.append(f"\n[Primary Descriptor]")
     desc = analysis.main_descriptor
     lines.append(f"  Name: {desc.filename}")
@@ -616,7 +667,7 @@ def generate_report(analysis: PreloaderAnalysis, verbose: bool = False) -> str:
     lines.append(f"  Total Length: {desc.total_length:,} bytes")
     lines.append(f"  Header Size: {desc.header_length} bytes")
     lines.append(f"  Signature Size: {desc.signature_length} bytes")
-    
+
     if analysis.boot_structure:
         lines.append(f"\n[Boot Configuration]")
         boot = analysis.boot_structure
@@ -624,46 +675,111 @@ def generate_report(analysis: PreloaderAnalysis, verbose: bool = False) -> str:
         lines.append(f"  Format Version: {boot.storage.format_version}")
         lines.append(f"  Sector Size: {boot.storage.sector_size}")
         lines.append(f"  Boot Loaders: {len(boot.loaders)}")
-        
+
         if verbose:
             for idx, loader in enumerate(boot.loaders):
                 lines.append(f"    [{idx}] Type={loader.component_type}, "
-                           f"Start=0x{loader.start_position:08x}")
-    
+                             f"Start=0x{loader.start_position:08x}")
+
     if analysis.system_info:
         info = analysis.system_info
         lines.append(f"\n[System Information]")
         lines.append(f"  Platform: {info.platform_identifier}")
         lines.append(f"  Project: {info.project_identifier}")
         lines.append(f"  ROM Version: {info.info_version}")
-        
+
         if info.security:
             sec = info.security
             lines.append(f"\n[Security Configuration]")
             lines.append(f"  Secure Boot: {get_enum_name(SignatureScheme, sec.secure_activation)}")
             lines.append(f"  USB Download: {get_enum_name(SignatureScheme, sec.usb_download_mode)}")
             lines.append(f"  Modem Auth: {'Enabled' if sec.modem_verification else 'Disabled'}")
-        
+
         if info.trusted_boot_parts:
             lines.append(f"\n[Trusted Components]")
             for part in info.trusted_boot_parts:
                 lines.append(f"  - {part}")
-    
+
     lines.append(f"\n[Signature Status]")
     lines.append(f"  Present: {'Yes' if analysis.attached_signature else 'No'}")
     if analysis.attached_signature and verbose:
         sig_hex = analysis.attached_signature[:64].hex()
         lines.append(f"  Data (first 64 bytes): {sig_hex}...")
-    
+
     lines.append(f"\n[GFH Sections]")
     lines.append(f"  Total Count: {len(analysis.all_sections)}")
     if verbose:
         for idx, section in enumerate(analysis.all_sections):
             type_name = get_enum_name(GfhSectionType, section.header.block_type)
             lines.append(f"    [{idx}] {type_name} - {section.header.block_length} bytes")
-    
+
     lines.append("\n" + "=" * 70)
     return "\n".join(lines)
+
+
+def build_json_output(analysis: PreloaderAnalysis) -> Dict[str, Any]:
+    output: Dict[str, Any] = {
+        'md5': analysis.md5,
+        'sha256': analysis.sha256,
+        'size': len(analysis.raw_data),
+        'gfh_offset': analysis.gfh_start_offset,
+        'file_info': {
+            'name': analysis.main_descriptor.filename,
+            'type': analysis.main_descriptor.payload_category,
+            'type_name': get_enum_name(PayloadType, analysis.main_descriptor.payload_category),
+            'storage': analysis.main_descriptor.target_storage,
+            'storage_name': get_enum_name(StorageType, analysis.main_descriptor.target_storage),
+            'security': analysis.main_descriptor.security_level,
+            'security_name': get_enum_name(SignatureScheme, analysis.main_descriptor.security_level),
+            'load_address': analysis.main_descriptor.execution_address,
+            'total_size': analysis.main_descriptor.total_length,
+            'header_size': analysis.main_descriptor.header_length,
+            'signature_size': analysis.main_descriptor.signature_length,
+        },
+        'signature_present': bool(analysis.attached_signature),
+        'gfh_section_count': len(analysis.all_sections),
+    }
+
+    if analysis.boot_structure:
+        boot = analysis.boot_structure
+        output['boot_config'] = {
+            'device': boot.storage.device_name,
+            'format_version': boot.storage.format_version,
+            'sector_size': boot.storage.sector_size,
+            'loader_count': len(boot.loaders),
+            'loaders': [
+                {
+                    'index': i,
+                    'component_type': l.component_type,
+                    'start': l.start_position,
+                    'end': l.end_boundary,
+                    'flags': l.flags,
+                }
+                for i, l in enumerate(boot.loaders)
+            ],
+        }
+
+    if analysis.system_info:
+        info = analysis.system_info
+        output['platform'] = info.platform_identifier
+        output['project'] = info.project_identifier
+        output['rom_version'] = info.info_version
+        output['secure_rom_exists'] = bool(info.secure_rom_exists)
+
+        if info.security:
+            sec = info.security
+            output['security_config'] = {
+                'secure_boot': get_enum_name(SignatureScheme, sec.secure_activation),
+                'usb_download': get_enum_name(SignatureScheme, sec.usb_download_mode),
+                'modem_auth': bool(sec.modem_verification),
+                'anti_clone': bool(sec.anti_clone_enabled),
+                'secure_data_storage': bool(sec.secure_data_storage),
+            }
+
+        if info.trusted_boot_parts:
+            output['trusted_components'] = info.trusted_boot_parts
+
+    return output
 
 
 def main():
@@ -675,52 +791,42 @@ def main():
     parser.add_argument('-o', '--output', help='Save extracted payload to file')
     parser.add_argument('-s', '--signature', help='Save signature to file')
     parser.add_argument('--json', action='store_true', help='Output in JSON format')
-    
+
     args = parser.parse_args()
-    
+
     try:
         input_path = Path(args.input_file)
         if not input_path.exists():
             raise FileNotFoundError(f"File not found: {args.input_file}")
-        
+
+        file_size = input_path.stat().st_size
+        if file_size > MAX_FILE_SIZE:
+            raise ValidationError(
+                f"File too large: {file_size:,} bytes (limit {MAX_FILE_SIZE:,})"
+            )
+
         with open(input_path, 'rb') as file_handle:
             binary_data = file_handle.read()
-        
+
         analysis = analyze_preloader(binary_data)
-        
+
         if args.json:
             import json
-            output_data = {
-                'md5': analysis.checksum,
-                'size': len(analysis.raw_data),
-                'gfh_offset': analysis.gfh_start_offset,
-                'file_info': {
-                    'name': analysis.main_descriptor.filename,
-                    'type': analysis.main_descriptor.payload_category,
-                    'type_name': get_enum_name(PayloadType, analysis.main_descriptor.payload_category),
-                    'storage': analysis.main_descriptor.target_storage,
-                    'load_address': analysis.main_descriptor.execution_address,
-                    'total_size': analysis.main_descriptor.total_length
-                }
-            }
-            if analysis.system_info:
-                output_data['platform'] = analysis.system_info.platform_identifier
-                output_data['project'] = analysis.system_info.project_identifier
-            print(json.dumps(output_data, indent=2))
+            print(json.dumps(build_json_output(analysis), indent=2))
         else:
             report = generate_report(analysis, args.verbose)
             print(report)
-        
+
         if args.output:
             with open(args.output, 'wb') as out_file:
                 out_file.write(analysis.extracted_code)
             print(f"\n[+] Extracted payload saved to: {args.output}")
-        
+
         if args.signature and analysis.attached_signature:
             with open(args.signature, 'wb') as sig_file:
                 sig_file.write(analysis.attached_signature)
             print(f"[+] Signature saved to: {args.signature}")
-    
+
     except FileNotFoundError as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
@@ -729,6 +835,9 @@ def main():
         sys.exit(1)
     except Exception as error:
         print(f"Unexpected error: {error}", file=sys.stderr)
+        if '--verbose' in sys.argv or '-v' in sys.argv:
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
 
 
